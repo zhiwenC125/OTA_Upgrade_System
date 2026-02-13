@@ -1,0 +1,73 @@
+# ============================================================
+# IoT2 — STM32 OTA 项目 .gitignore
+# ============================================================
+
+# ─── CMake 构建输出（App + Bootloader） ───────────────────
+build/
+Bootloader/build_boot/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+**/compile_commands.json
+
+# ─── 编译产物 ────────────────────────────────────────────
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.o
+*.d
+*.a
+*.su
+
+# ─── ESP-IDF 构建输出 ─────────────────────────────────────
+ESP_Firmware/build/
+ESP_Firmware/managed_components/
+ESP_Firmware/dependencies.lock
+
+# ─── Python 虚拟环境 & 缓存 ──────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# ─── OTA 测试临时文件 ─────────────────────────────────────
+tests/*.log
+ota_flag_done.bin
+
+# ─── IDE / 编辑器 ────────────────────────────────────────
+.vscode/settings.json
+.vscode/launch.json
+.vscode/tasks.json
+.vscode/*.log
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Keil MDK ────────────────────────────────────────────
+*.uvguix.*
+*.uvoptx
+*.scvd
+Listings/
+Objects/
+RTE/
+
+# ─── STM32CubeIDE ────────────────────────────────────────
+Debug/
+Release/
+.settings/
+.cproject
+.project
+
+# ─── STM32CubeProgrammer 临时文件 ─────────────────────────
+*.rfu
+
+# ─── 系统文件 ─────────────────────────────────────────────
+desktop.ini
+ehthumbs.db
