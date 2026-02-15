@@ -15,27 +15,34 @@
 | Phase 2 | Flash 驱动（内部 flash_if + 外部 w25qxx） | ✅ 完成 |
 | Phase 3 | Bootloader（SPI 读取 + 固件拷贝 + 跳转） | ✅ 完成 |
 | Phase 4 | OTA Task 完整实现（协议 + 状态机 + CRC32） | ✅ 完成 |
-| Phase 5 | MQTT 集成（ESP32 to STM32 链路） | ⏳ 待开始 |
-| Phase 6 | 端到端测试 + 回滚机制 | ✅ T1~T4 全部通过 |
+| Phase 5 | MQTT 集成（ESP32 WiFi/MQTT 透明桥） | ✅ 完成 |
+| Phase 6 | 端到端测试（MQTT→ESP32→STM32→W25Q32→Bootloader） | ✅ 完成 |
+| Phase 7 | 回滚机制（BOOT_COUNTING + W25Q32 Backup 区） | ✅ 完成 |
 
 ---
 
-## 测试结果（T1 ~ T4 全部通过）
+## 测试结果（全部通过）
 
 | 测试 | 内容 | 验证点 | 结果 |
 | --- | --- | --- | --- |
 | T1 | 系统启动 + Bootloader 跳转 | RTOS 双任务打印 ready，Bootloader VTOR 正确 | ✅ PASS |
 | T2 | W25Q32 SPI 读写 + OTA 协议状态机 | 假固件写入 W25Q32，CRC32 校验，Bootloader 拷贝 | ✅ PASS |
 | T3 | 错误注入（CRC16 / 序号 / ABORT） | 3 个 Case 全部正确响应 NACK/ERR | ✅ PASS |
-| T4 | 完整 OTA 流程（真实固件） | 94 帧传输，CRC32 OK，Bootloader 拷贝，新固件启动 | ✅ PASS |
+| T4 | 完整 OTA 流程（USART1 直连） | 真实固件传输，CRC32 OK，新固件启动 | ✅ PASS |
+| T5 | MQTT 端到端 OTA（Python→MQTT→ESP32→STM32） | v3.0→v4.0 固件升级，BOOT_COUNTING→CONFIRMED | ✅ PASS |
+| T6 | 回滚机制（假固件 → 3次失败 → 自动回滚） | count=03 触发回滚，从 Backup 恢复，旧固件运行 | ✅ PASS |
 
-**T4 关键输出节选：**
+**T5/T6 关键输出节选：**
 
 ```text
-[BOOT] W25Q32[0..7]=00 50 00 20 D5 2A 00 08   ← SPI1 读写正常
-[BOOT] App MSP=0x20005000 ResetVec=0x08002AD5  ← 有效 App
-[BOOT] Jumping to App...
-[OTA] Task started. Waiting for firmware...    ← 新固件运行成功
+[BOOT] Flag -> BOOT_COUNTING(1)            ← T5: 新固件首次启动
+[OTA] New firmware confirmed OK.           ← T5: App 写入 CONFIRMED
+[OTA] Task started v4.0.                  ← T5: 升级成功
+
+[BOOT] BOOT_COUNTING: count=03            ← T6: 第3次失败
+[BOOT] Too many failed boots! Rolling back ← T6: 触发回滚
+[BOOT] Rollback complete. Flag -> CONFIRMED
+[OTA] Task started v4.0.                  ← T6: 旧固件恢复运行
 ```
 
 ---
@@ -54,29 +61,54 @@
 
 | 分区 | 起始地址 | 大小 | 作用 |
 | --- | --- | --- | --- |
-| Download | `0x000000` | 64KB | 新固件暂存（App 写入） |
-| Backup | `0x010000` | 64KB | 旧固件备份（回滚用） |
-| Meta | `0x020000` | 4KB | 版本号/CRC32/固件大小 |
+| Download | `0x000000` | 64KB | 新固件暂存（App OTA 接收时写入） |
+| Backup | `0x010000` | 64KB | 旧固件备份（OTA START 时自动备份，回滚用） |
+| Meta | `0x020000` | 4KB | 版本号/CRC32/固件大小（预留） |
 | Free | `0x021000` | ~3.8MB | 日志/配置预留 |
+
+### OTA Flag 区（内部 Flash 0x0800FC00）
+
+| 偏移 | 字段 | 说明 |
+| --- | --- | --- |
+| +0 | state (4B) | 见下表 |
+| +4 | boot_count (4B) | BOOT_COUNTING 时的启动尝试次数 |
+
+| state 值 | 含义 |
+| --- | --- |
+| `0xFFFFFFFF` | 空（擦除后默认值） |
+| `0xAA55AA55` | UPGRADE_PENDING — 新固件待拷贝 |
+| `0xC3A5C3A5` | BOOT_COUNTING — 新固件已拷贝，等待 App 确认（超过 3 次则回滚） |
+| `0x5A5AA5A5` | CONFIRMED — App 已确认正常运行 |
+| `0x55AA55AA` | DONE — 兼容旧版 |
 
 ---
 
-## OTA 升级完整流程
+## OTA 升级完整流程（Phase 7 含回滚）
 
 ```text
-树莓派5 -- WiFi/MQTT --> ESP32-S3 -- USART2 --> STM32 App
-  1. 收 START 帧 -> 擦除 W25Q32 Download 区
-  2. 收 DATA 帧xN -> 逐包写入 W25Q32，滚动计算 CRC32
+PC (Python) -- MQTT --> ESP32-S3 -- USART2 --> STM32 App (OTA Task v4.0)
+  1. 收 START 帧
+     a. 备份当前 App (55KB) 到 W25Q32 Backup 区 (0x010000)  ← 回滚数据源
+     b. 擦除 W25Q32 Download 区 (0x000000)
+  2. 收 DATA 帧xN -> 逐包写入 W25Q32 Download，滚动计算 CRC32
   3. 收 END 帧 -> 校验 CRC32
-  4. Flash_If_SetFlag(OTA_FLAG_UPGRADE_PENDING)
+  4. Flash_If_SetFlagEx(UPGRADE_PENDING, 0)
   5. HAL_NVIC_SystemReset()
 
-Bootloader（0x08000000）
-  1. 读 Flag -> 检测到 UPGRADE_PENDING
-  2. 初始化 SPI1 + W25Q32（探测前 8 字节，全 0xFF 则跳过）
+Bootloader（0x08000000）— 正常升级路径
+  1. 读 Flag == UPGRADE_PENDING
+  2. 初始化 SPI1，探测 W25Q32 前 8 字节（全 0xFF 则跳过）
   3. 擦除 App 区（55KB）
-  4. 从 W25Q32 Download 读取 -> 写入 App 区
-  5. 写 OTA_FLAG_UPGRADE_DONE -> 跳转 0x08002000
+  4. 从 W25Q32 Download (0x000000) 拷贝 -> 内部 Flash App 区
+  5. 写 Flag = BOOT_COUNTING(1) -> 跳转 App
+
+App 首次成功启动（OTA Task 初始化完成）
+  -> 检测 Flag == BOOT_COUNTING -> 写 Flag = CONFIRMED  ← 确认新固件健康
+
+Bootloader — 回滚路径（新固件连续失败 3 次）
+  1. 读 Flag == BOOT_COUNTING, count >= 3
+  2. 从 W25Q32 Backup (0x010000) 恢复 -> 内部 Flash App 区
+  3. 写 Flag = CONFIRMED -> 跳转旧 App
 ```
 
 ---
@@ -211,29 +243,55 @@ RECEIVING -- CMD_OTA_DATA（seq=1,2,...）--> RECEIVING
 
 ---
 
-## 测试脚本（tests/ota_sender.py）
+## 测试脚本（tests/ota_mqtt_sender.py）
+
+依赖：`pip install paho-mqtt`，需要 MQTT Broker（如 Mosquitto）在局域网运行。
 
 ```bash
-# 列出串口
-python tests/ota_sender.py --list-ports
+# 协议状态机测试（假固件 1KB）
+python tests/ota_mqtt_sender.py --broker 192.168.0.3 --test-protocol
 
-# T2: OTA 协议状态机（假固件 1KB，会触发 Bootloader）
-python tests/ota_sender.py --port COM7 --test-protocol
+# 错误注入测试（CRC16 / 序号跳变 / ABORT 恢复）
+python tests/ota_mqtt_sender.py --broker 192.168.0.3 --test-error-injection
 
-# T3: 错误注入（CRC16/序号/ABORT）
-python tests/ota_sender.py --port COM7 --test-error-injection
+# 完整 OTA（真实固件）
+python tests/ota_mqtt_sender.py --broker 192.168.0.3 --firmware build/STM32_AIoT_Project.bin
 
-# T4: 完整 OTA（真实固件）
-python tests/ota_sender.py --port COM7 --firmware build/STM32_AIoT_Project.bin
+# 调整帧间延迟（默认 100ms）
+python tests/ota_mqtt_sender.py --broker 192.168.0.3 --firmware build/STM32_AIoT_Project.bin --inter-frame-ms 50
 ```
 
-> 脚本通过 DTR 信号自动复位 STM32（CH340 NRST 联动），等待 4 秒后发送固件。
+**MQTT 主题：**
+
+| 主题 | 方向 | 内容 |
+| --- | --- | --- |
+| `device/stm32_iot2/ota/cmd` | PC → STM32 | OTA 二进制帧（QoS 0） |
+| `device/stm32_iot2/ota/status` | STM32 → PC | ACK/NACK/状态文本 |
+| `device/stm32_iot2/heartbeat` | STM32 → PC | ESP32 心跳（OTA 期间自动抑制） |
 
 ---
 
-## 下一步
+## 硬件架构
 
-- [ ] Phase 5: 实现 ESP32 侧 MQTT to UART 转发，打通完整数据链路
-- [ ] 回滚机制：Backup 槽存旧固件，升级失败自动回滚（W25Q32 `0x010000`）
-- [ ] 版本号管理：Meta 区（`0x020000`）存储固件版本、大小、CRC32
-- [ ] Bootloader 防砖保护：连续升级失败 N 次后强制回滚
+```text
+PC (Python ota_mqtt_sender.py)
+    │  WiFi / MQTT (paho-mqtt)
+    ▼
+[MQTT Broker (Mosquitto)]
+    │  WiFi
+    ▼
+ESP32-S3 (ESP-IDF 5.5.2)
+  └─ UART1 GPIO17(TX)/GPIO18(RX) ──────────────────────► STM32F103C8T6
+                                                           ├─ USART2 PA2/PA3: ESP32 通信
+                                                           ├─ USART1 PA9/PA10: 调试输出
+                                                           └─ SPI1 PA4/PA5/PA6/PA7: W25Q32
+```
+
+---
+
+## 下一步（可选）
+
+- [ ] Phase 8：IWDG 硬件看门狗联动（检测运行中崩溃，触发 boot_count 累加）
+- [ ] Phase 9：固件版本信息嵌入（Meta 区 + MQTT 版本上报）
+- [ ] Phase 10：远程诊断（FreeRTOS 堆/任务状态定时上报 MQTT）
+- [ ] Phase 11：固件签名验证（ECDSA，防止非法固件注入）

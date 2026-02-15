@@ -14,7 +14,7 @@
 5. [OTA 状态机](#五ota-状态机)
 6. [CRC 校验机制](#六crc-校验机制)
 7. [调试中踩过的坑](#七调试中踩过的坑)
-8. [完整升级流程时序图](#八完整升级流程时序图)
+8. [完整升级流程时序图](#八完整升级流程时序图phase-7含回滚)
 9. [面试常见问题](#九面试常见问题)
 
 ---
@@ -92,20 +92,29 @@ Bootloader 是上电后第一段运行的程序，负责：
 
 ### 2.3 OTA Flag 标志位定义
 
-| 标志值 | 含义 | 写入时机 |
+Flag 区（`0x0800FC00`，1KB）存储两个 word：
+
+| 偏移 | 字段 | 说明 |
 | --- | --- | --- |
-| `0xFFFFFFFF` | 未升级（Flash 擦除后默认值） | 初始状态 |
-| `0xAA55AA55` | `UPGRADE_PENDING` — 待安装 | OTA Task 收完并校验通过后写入 |
-| `0x55AA55AA` | `UPGRADE_DONE` — 已安装 | Bootloader 拷贝完成后写入 |
+| +0 | state (4B) | 状态魔数（见下表） |
+| +4 | boot_count (4B) | BOOT_COUNTING 时的启动尝试次数 |
+
+| state 值 | 名称 | 写入方 | 含义 |
+| --- | --- | --- | --- |
+| `0xFFFFFFFF` | EMPTY | — | 擦除后默认值，无升级 |
+| `0xAA55AA55` | UPGRADE_PENDING | OTA Task (App) | 新固件已校验通过，待 Bootloader 拷贝 |
+| `0xC3A5C3A5` | BOOT_COUNTING | Bootloader | 新固件已拷贝，等待 App 确认（超过 3 次 → 回滚） |
+| `0x5A5AA5A5` | CONFIRMED | App / Bootloader | App 正常运行确认 / 回滚完成标记 |
+| `0x55AA55AA` | DONE | — | 兼容旧版，等同 CONFIRMED |
 
 **写入机制（STM32F103 半字写入）：**
 
 ```c
-// 32位标志需要两次 16-bit 写入
-HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,
-                  FLASH_FLAG_ADDR,     flag & 0xFFFF);
-HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,
-                  FLASH_FLAG_ADDR + 2, (flag >> 16) & 0xFFFF);
+// Flash_If_SetFlagEx(state, boot_count) 实现：
+// 先擦除 Flag 页，再依次写入两个 4-byte word（各拆成两次 16-bit 写入）
+Flash_If_Erase(FLASH_FLAG_ADDR, 1);
+Flash_If_Write(FLASH_FLAG_ADDR,      &state,      4);  // word0: state
+Flash_If_Write(FLASH_FLAG_ADDR + 4,  &boot_count, 4);  // word1: boot_count
 ```
 
 > STM32F103 内部 Flash **不支持 32-bit 一次写入**，只能按 16-bit 半字写。
@@ -118,7 +127,7 @@ HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,
 
 Bootloader 是独立的 CMake 工程（`Bootloader/CMakeLists.txt`），与 App 分开编译：
 
-```
+```text
 Bootloader 依赖：HAL（Flash/SPI/GPIO/RCC） + CMSIS + 启动文件
 Bootloader 不包含：FreeRTOS、USART DMA、任何 App 业务代码
 ```
@@ -461,7 +470,7 @@ STM32F103 内置 CRC32 硬件单元，但：
 
 **根本原因：**
 
-```
+```text
 startup_stm32f103xb.s:
   .thumb_set SysTick_Handler, Default_Handler
   Default_Handler:
@@ -490,7 +499,7 @@ void SysTick_Handler(void) { HAL_IncTick(); }
 
 **根本原因：**
 
-```
+```text
 main.c 未调用 W25Qxx_Init()
 → hspi1.Instance = NULL（全零）
 → HAL_SPI_Transmit/Receive: 检查 hspi1.State != HAL_SPI_STATE_READY
@@ -519,6 +528,7 @@ int main(void) {
 ```
 
 **教训：**
+
 - 外设初始化必须在调度器前完成并检查返回值
 - CRC 校验的数据源必须是写入目标（W25Q32 回读），而非写入源（UART 缓冲区）
 - HAL 函数失败时静默返回错误码，不会主动报告，必须手动检查
@@ -564,49 +574,54 @@ App 烧录在 `0x08002000`，但 CPU 上电默认向量表在 `0x08000000`。
 
 ---
 
-## 八、完整升级流程时序图
+## 八、完整升级流程时序图（Phase 7，含回滚）
 
 ```text
-PC (ota_sender.py)          STM32 App (ota_task)        Bootloader
-        │                          │                         │
-        │── DTR=High (100ms) ─────►│ (复位)                  │
-        │── DTR=Low ───────────────►│                         │
-        │                          │                    上电执行
-        │                          │               ┌──────────────────┐
-        │                          │               │读 OTA Flag        │
-        │                          │               │= DONE/0xFF        │
-        │                          │               │→ 正常跳转 App     │
-        │                          │               └────────┬─────────┘
-        │                          │◄───────────────── 跳转 │
-        │<── 等待 4s ──────────────►│                        │
-        │                          │ [OTA] Task started...  │
-        │── START 帧 ─────────────►│                        │
-        │                          │擦 W25Q32(~300ms)       │
-        │◄─── [OTA] READY ─────────│                        │
-        │                          │                        │
-        │── DATA seq=0 ───────────►│写 W25Q32               │
-        │◄─── ACK seq=0 ───────────│累积 CRC32              │
-        │         ...              │         ...            │
-        │── DATA seq=N ───────────►│                        │
-        │◄─── ACK seq=N ───────────│                        │
-        │                          │                        │
-        │── END 帧 ───────────────►│                        │
-        │                          │校验 CRC32              │
-        │◄─ [OTA] CRC32 OK ────────│                        │
-        │◄─ [OTA] DONE. Reset... ──│                        │
-        │                          │写 Flag=PENDING         │
-        │                          │SystemReset()           │
-        │                          │         ────────────── ►│
-        │                          │                   ┌──────────────────┐
-        │                          │                   │读 Flag=PENDING    │
-        │                          │                   │探测 W25Q32 前8字节│
-        │                          │                   │擦除 App 区(55KB)  │
-        │                          │                   │拷贝 W25Q32→Flash  │
-        │                          │                   │写 Flag=DONE       │
-        │                          │                   └────────┬─────────┘
-        │◄─ [BOOT] Jumping... ─────│◄──────────── 跳转 App     │
-        │◄─ [OTA] Task started ────│                            │
-        │                          │ 新固件运行成功 ✅           │
+PC (ota_mqtt_sender.py)   ESP32-S3      STM32 App (ota_task v4.0)   Bootloader
+        │                    │                   │                       │
+        │─ MQTT publish ─────►│                  │                       │
+        │  cmd topic          │── UART ──────────►│                       │
+        │  START 帧           │                  │备份当前App→W25Q32 Backup│
+        │                     │                  │擦 W25Q32 Download     │
+        │                     │◄── UART ─────────│  (~3.7s)              │
+        │◄─ MQTT status ──────│                  │                       │
+        │   [OTA] READY       │                  │                       │
+        │                     │                  │                       │
+        │─ MQTT DATA seq=0 ───►│── UART ─────────►│写 W25Q32,累积CRC32    │
+        │◄─ MQTT ACK seq=0 ───│◄── UART ─────────│                       │
+        │        ...          │        ...        │        ...            │
+        │─ MQTT DATA seq=N ───►│── UART ─────────►│                       │
+        │◄─ MQTT ACK seq=N ───│◄── UART ─────────│                       │
+        │                     │                  │                       │
+        │─ MQTT END ──────────►│── UART ─────────►│校验 CRC32             │
+        │◄─ MQTT CRC32 OK ────│◄── UART ─────────│写 Flag=PENDING+count=0│
+        │                     │                  │SystemReset()          │
+        │                     │                  │         ──────────────►│
+        │                     │                  │                  ┌─────────────────┐
+        │                     │                  │                  │读 Flag=PENDING   │
+        │                     │                  │                  │探测 W25Q32[0..7] │
+        │                     │                  │                  │擦 App(55KB)      │
+        │                     │                  │                  │拷贝 Download→Flash│
+        │                     │                  │                  │写 Flag=           │
+        │                     │                  │                  │  BOOT_COUNTING(1) │
+        │                     │                  │                  └────────┬─────────┘
+        │                     │                  │◄──────────── 跳转 App     │
+        │◄─ MQTT status ──────│◄── UART ─────────│ confirmed OK             │
+        │                     │                  │ 写 Flag=CONFIRMED        │
+        │                     │                  │ Task started v4.0 ✅     │
+
+--- 回滚路径（新固件 3 次启动失败）---
+
+        │                     │                  │                  ┌─────────────────┐
+        │                     │                  │                  │读Flag=BOOT_COUNT │
+        │                     │                  │                  │count=03≥3        │
+        │                     │                  │                  │擦 App(55KB)      │
+        │                     │                  │                  │拷贝 Backup→Flash │
+        │                     │                  │                  │写 Flag=CONFIRMED │
+        │                     │                  │                  └────────┬─────────┘
+        │                     │                  │◄──────────── 跳转旧App   │
+        │                     │                  │ Task started v4.0 ✅     │
+        │                     │                  │（旧固件已恢复）           │
 ```
 
 ---
@@ -623,21 +638,36 @@ PC (ota_sender.py)          STM32 App (ota_task)        Bootloader
 
 ### Q3：如果升级过程中断电怎么办（防砖保护）？
 
-**答：** 本项目当前的保护措施：
+**答：** 本项目（Phase 7）已实现完整的防砖 + 回滚机制：
+
+**传输阶段断电（OTA Task 正在接收）：**
 
 | 断电时机 | 结果 | 恢复方式 |
 | --- | --- | --- |
-| 写 W25Q32 期间 | Flag 未设为 PENDING，Bootloader 正常启动旧 App | 自动恢复 |
-| W25Q32 写完，Flag 写 PENDING 前 | 同上 | 自动恢复 |
-| Flag=PENDING，Bootloader 擦 App 期间 | App 区被擦，W25Q32 数据完整 | 下次复位继续拷贝 |
-| Bootloader 拷贝 Flash 期间 | App 区部分写入，MSP 可能无效 | 下次复位继续（Flag 仍 PENDING）|
-| 拷贝完，Flag 未写 DONE | 下次复位再次拷贝（幂等操作）| 自动恢复 |
+| 写 W25Q32 期间 | Flag 未设 PENDING，Bootloader 正常启动旧 App | 自动恢复 ✅ |
+| W25Q32 写完，Flag 写 PENDING 前 | 同上 | 自动恢复 ✅ |
 
-**待实现：** Backup 区存旧固件 + 连续失败计数器，超过阈值自动回滚。
+**Bootloader 拷贝阶段断电：**
+
+| 断电时机 | 结果 | 恢复方式 |
+| --- | --- | --- |
+| 擦 App 期间 / 拷贝 Flash 期间 | Flag 仍 PENDING，W25Q32 Backup 有旧固件 | 下次复位继续拷贝（幂等）✅ |
+| 拷贝完，写 BOOT_COUNTING 前 | App 区已是新固件，重启后 Bootloader 再次拷贝（可能重复但无害） | 自动恢复 ✅ |
+
+**新固件运行崩溃（boot_count 机制）：**
+
+| 情况 | 机制 | 结果 |
+| --- | --- | --- |
+| 新固件 MSP 无效（完全不能运行） | Bootloader JumpToApp 失败 → 不跳转 → 手动复位 → count++ | 3 次后自动回滚 ✅ |
+| 新固件能启动但立刻崩溃 | IWDG 看门狗超时复位 → count++ | 3 次后自动回滚（需启用 IWDG，Phase 8 实现） |
+| 新固件正常 | OTA Task 写 CONFIRMED，count 清零 | 正常运行 ✅ |
+
+**回滚源**：OTA START 时 App 已将当前固件备份到 W25Q32 Backup 区（`0x010000`），Bootloader 回滚时从该区域恢复。
 
 ### Q4：CRC16 和 CRC32 为什么要两套？
 
 **答：**
+
 - CRC16 覆盖单帧，实时校验，**发现错误立即 NACK**，不等到最后。好处是及时反馈，避免继续写入损坏数据。
 - CRC32 覆盖全部固件，**END 帧时最终确认**。好处是对整体完整性提供更强保证（CRC32 碰撞概率远低于 CRC16）。
 
