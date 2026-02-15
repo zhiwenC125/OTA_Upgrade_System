@@ -1,6 +1,7 @@
 # IoT2 — STM32 OTA 空中升级项目
 
 **MCU:** STM32F103C8T6 (Cortex-M3, 72MHz, 64KB Flash, 20KB RAM)
+**网关:** ESP32-S3 (ESP-IDF 5.5.2, WiFi + MQTT)
 **外部存储:** W25Q32 SPI NOR Flash (4MB)
 **RTOS:** FreeRTOS v10.0.1
 **方案:** 内部 Bootloader + 外部 Download（方案 A）
@@ -15,9 +16,37 @@
 | Phase 2 | Flash 驱动（内部 flash_if + 外部 w25qxx） | ✅ 完成 |
 | Phase 3 | Bootloader（SPI 读取 + 固件拷贝 + 跳转） | ✅ 完成 |
 | Phase 4 | OTA Task 完整实现（协议 + 状态机 + CRC32） | ✅ 完成 |
-| Phase 5 | MQTT 集成（ESP32 WiFi/MQTT 透明桥） | ✅ 完成 |
+| Phase 5 | ESP32-S3 WiFi/MQTT 透明桥接网关 | ✅ 完成 |
 | Phase 6 | 端到端测试（MQTT→ESP32→STM32→W25Q32→Bootloader） | ✅ 完成 |
 | Phase 7 | 回滚机制（BOOT_COUNTING + W25Q32 Backup 区） | ✅ 完成 |
+
+---
+
+## 硬件架构
+
+```text
+PC (Python ota_mqtt_sender.py)
+    │  WiFi / MQTT (paho-mqtt, QoS 0)
+    ▼
+[MQTT Broker (Mosquitto)]         ← 局域网 192.168.0.3
+    │  WiFi
+    ▼
+ESP32-S3 (ESP-IDF 5.5.2)
+  ├─ WiFi STA (wifi_station.c)
+  ├─ MQTT Client (mqtt_client_task.c)
+  │    ├─ 订阅 ota/cmd → 入队 s_ota_tx_queue
+  │    ├─ uart_ota_tx_task (prio 6): 出队 → UART1 发送
+  │    └─ mqtt_heartbeat_task (prio 3): 10s JSON 心跳
+  └─ UART1 GPIO17(TX)/GPIO18(RX) ──────────────► STM32F103C8T6
+       115200 8N1, TX buf=512B                     ├─ USART2 PA2/PA3: ESP32 通信
+                                                   │   └─ vEsp32CommTask (prio 2)
+                                                   │       SOF 帧重同步 → ota_process_frame()
+                                                   ├─ USART1 PA9/PA10: PC 调试 + 直连 OTA
+                                                   │   └─ vOtaProcessTask (prio 3)
+                                                   │       DMA 双缓冲 + IDLE 检测
+                                                   └─ SPI1 PA4/PA5/PA6/PA7: W25Q32
+                                                       固件暂存 + 备份
+```
 
 ---
 
@@ -55,7 +84,7 @@
 | --- | --- | --- | --- |
 | Bootloader | `0x08000000` | 8KB | 上电首先运行，含 SPI 驱动 |
 | App | `0x08002000` | 55KB | 主业务代码（FreeRTOS + 各任务） |
-| OTA Flag | `0x0800FC00` | 1KB | 升级标志位 |
+| OTA Flag | `0x0800FC00` | 1KB | 升级标志位（state + boot_count） |
 
 ### 外部 W25Q32 (4MB)
 
@@ -133,98 +162,55 @@ END   payload: 空
 
 ---
 
-## Phase 1 — RTOS 框架与 UART/DMA 通信
-
-### 任务分配
-
-| 任务 | 优先级 | 栈 | 功能 |
-| --- | --- | --- | --- |
-| `vOtaProcessTask` | 3（高） | 512 words | OTA 固件接收与升级 |
-| `vEsp32CommTask` | 2（中） | 256 words | ESP32-S3 通信转发 |
-
-### UART/DMA 双缓冲架构（Ping-Pong）
+## 项目目录结构
 
 ```text
-ISR（IDLE 检测）                    任务（Deferred Processing）
-1. 停 DMA                           取信号量（阻塞等待）
-2. 计算帧长度                        读 buf[1 - g_uart_rx_buf_idx]
-3. 切换 buf 索引  --信号量-->         处理数据
-4. 在新 buf 上重启 DMA
-5. xSemaphoreGiveFromISR
+IoT2/
+├── CMakeLists.txt                          App 构建系统（arm-none-eabi-gcc）
+├── App/
+│   ├── OTA/
+│   │   ├── Inc/ota_task.h                  OTA 协议定义 + 帧格式
+│   │   └── Src/ota_task.c                  OTA 状态机 + CRC 校验 + 回滚备份
+│   └── Test/
+│       └── Src/comm_test.c                 硬件通信测试套件
+├── Bootloader/
+│   ├── CMakeLists.txt                      独立构建（无 FreeRTOS）
+│   ├── STM32F103C8Tx_BOOT.ld              链接脚本 (0x08000000, 8KB)
+│   ├── main.c                              升级/回滚/跳转逻辑
+│   └── system_boot.c                       HSI 8MHz 时钟（无 PLL）
+├── Core/
+│   ├── Inc/
+│   │   ├── flash_if.h                      内部 Flash 分区 + OTA Flag 定义
+│   │   ├── FreeRTOSConfig.h                6KB 堆, 1000Hz Tick, prio≥5 for ISR
+│   │   ├── usart1.h                        DMA 双缓冲 (256B)
+│   │   └── usart2.h                        DMA 双缓冲 (257B, 防 TC/IDLE 竞争)
+│   ├── Src/
+│   │   ├── flash_if.c                      内部 Flash 擦/写/读 + SetFlagEx
+│   │   ├── main.c                          App 入口: 外设初始化→信号量→任务
+│   │   ├── stm32f1xx_it.c                  USART1/2 IDLE ISR (双缓冲切换)
+│   │   ├── sys_config.c                    PLL 64MHz + GPIO
+│   │   └── syscalls.c                      printf → USART1 重定向
+│   └── Startup/
+│       ├── startup_stm32f103xb.s           启动文件 + 向量表
+│       └── STM32F103C8Tx_FLASH.ld          App 链接脚本 (0x08002000, 55KB)
+├── ESP_Firmware/
+│   ├── CMakeLists.txt                      ESP-IDF 构建
+│   └── main/
+│       ├── hello_world_main.c              ESP32 入口: WiFi→MQTT→UART→任务
+│       ├── wifi_station.c/h                WiFi STA 连接（事件组等待）
+│       ├── mqtt_client_task.c/h            MQTT 订阅 + OTA 帧队列 + 心跳
+│       ├── mqtt_config.h                   Broker URI + 主题定义
+│       └── wifi_config.h                   SSID/密码
+├── Hardware/
+│   ├── ESP32/
+│   │   └── esp32_comm.c/h                  STM32 侧 ESP32 通信任务
+│   └── W25Qxx/
+│       └── w25qxx.c/h                      SPI Flash 驱动（JEDEC 自动检测）
+└── tests/
+    ├── ota_mqtt_sender.py                  MQTT OTA 发送器（协议/错误/完整测试）
+    ├── ota_sender.py                       串口直连 OTA 发送器
+    └── diag_serial.py                      串口诊断工具
 ```
-
-ISR 永远只写"当前 buf"，任务永远只读"另一个 buf"，无需加锁。
-
----
-
-## Phase 2 — Flash 驱动
-
-### 内部 Flash（flash_if.c）
-
-- `Flash_If_Erase(addr, pages)` — 页擦除（1KB/页）
-- `Flash_If_Write(addr, src, len)` — 半字写入（STM32F103 只支持 16-bit 编程）
-- `Flash_If_SetFlag(flag)` / `Flash_If_GetFlag()` — OTA 标志位管理
-
-### 外部 W25Q32（w25qxx.c）
-
-- `W25Qxx_Init()` — JEDEC ID 检测（支持 W25Q32/64/128），**必须在 FreeRTOS 启动前调用**
-- `W25Qxx_Write(addr, data, len)` — 任意长度写入（自动分页）
-- `W25Qxx_EraseBlock64(addr)` — 64KB block 擦除
-- `W25Qxx_Read(addr, buf, len)` — 任意长度读取
-
-> **注意：** `W25Qxx_Init()` 必须在 `xTaskCreate` 之前调用，否则 `hspi1` 句柄
-> 全零，后续所有 SPI 操作静默失败（HAL 检查 State != READY 直接返回错误）。
-
----
-
-## Phase 3 — Bootloader
-
-独立 CMake 工程，无 FreeRTOS，烧录在 `0x08000000`（8KB 以内）。
-
-启动序列：
-
-1. 读 `0x0800FC00` 标志位
-2. 若为 `OTA_FLAG_UPGRADE_PENDING`（`0xAA55AA55`）：初始化 SPI → 探测前 8 字节（防空 Flash） → 擦 App 区 → 拷贝固件 → 写 `OTA_FLAG_UPGRADE_DONE`
-3. 设置 MSP + 跳转 `0x08002000`
-
-**关键修复（调试中发现）：**
-
-| 问题 | 根因 | 修复 |
-| --- | --- | --- |
-| 复位后无任何串口输出 | `SysTick_Handler` 被 `startup.s` alias 到 `Default_Handler`（死循环），`HAL_Init()` 开启 SysTick 1ms 后立即挂死 | 在 Bootloader/main.c 添加 `void SysTick_Handler(void){ HAL_IncTick(); }` 覆盖弱定义 |
-| W25Q32 读回全 0xFF | App 从未调用 `W25Qxx_Init()`，`hspi1.Instance=0`，所有 SPI 操作静默失败 | main.c 加 `W25Qxx_Init()` 调用 |
-| Bootloader 擦 App 后无法跳转 | W25Q32 写失败 → 读回全 0xFF → 拷贝 0xFF → MSP=0xFFFFFFFF → 校验失败 | 上述两点修复后自动解决 |
-
----
-
-## Phase 4 — OTA Task 完整实现
-
-`App/OTA/Src/ota_task.c` — 状态机 + 协议解析 + CRC 校验
-
-### 状态机
-
-```text
-IDLE
- | CMD_OTA_START（擦 W25Q32 Download 区）
- v
-STARTED
- | CMD_OTA_DATA（seq=0）
- v
-RECEIVING -- CMD_OTA_DATA（seq=1,2,...）--> RECEIVING
- | CMD_OTA_END（大小 + CRC32 双重校验）
- v
-[设 OTA Flag -> SystemReset -> Bootloader]
-
-任意状态 + CMD_OTA_ABORT --> IDLE
-序号不连续 / 溢出 / CRC16 错误 --> ERROR（等待 ABORT）
-```
-
-### 校验机制
-
-| 层次 | 算法 | 覆盖范围 |
-| --- | --- | --- |
-| 帧完整性 | CRC16-CCITT | 每帧 [CMD..PAYLOAD] |
-| 固件完整性 | CRC32（IEEE 802.3） | 全部固件，END 时最终校验 |
 
 ---
 
@@ -235,11 +221,40 @@ RECEIVING -- CMD_OTA_DATA（seq=1,2,...）--> RECEIVING
 | USART1 | PA9(TX) / PA10(RX) | 调试 + OTA 接收（115200 baud） |
 | USART2 | PA2(TX) / PA3(RX) | ESP32-S3 通信 |
 | SPI1 | PA5(SCK) / PA6(MISO) / PA7(MOSI) / PA4(CS) | W25Q32（Mode0，APB2/4=16MHz） |
+| ESP32 UART1 | GPIO17(TX) / GPIO18(RX) | STM32 通信（115200 baud） |
 
 **时钟配置：**
 
 - App：HSI/2 × PLL16 = 64MHz（`system_stm32f1xx.c`，`VECT_TAB_OFFSET=0x2000`）
 - Bootloader：HSI 8MHz（无 PLL，`system_boot.c`，VTOR 在 `0x08000000`）
+
+---
+
+## STM32 任务分配
+
+| 任务 | 优先级 | 栈 | 功能 |
+| --- | --- | --- | --- |
+| `vOtaProcessTask` | 3（高） | 512 words | USART1 DMA 接收 + OTA 协议处理 |
+| `vEsp32CommTask` | 2（中） | 512 words | USART2 DMA 接收 + ESP32 帧转发 |
+
+## ESP32 任务分配
+
+| 任务 | 优先级 | 栈 | 功能 |
+| --- | --- | --- | --- |
+| `uart_ota_tx_task` | 6（高） | 2048 | OTA 帧出队 → UART 发送（mqtt_client_task.c） |
+| `uart_tx_task` | 5 | 2048 | 心跳发送（OTA session 期间自动抑制） |
+| `uart_rx_task` | 5 | 2048 | STM32 回复接收 → MQTT status 转发 |
+| `mqtt_heartbeat_task` | 3 | 2048 | MQTT JSON 心跳（10s 间隔） |
+
+---
+
+## MQTT 主题
+
+| 主题 | 方向 | 内容 |
+| --- | --- | --- |
+| `device/stm32_iot2/ota/cmd` | PC → STM32 | OTA 二进制帧（QoS 0） |
+| `device/stm32_iot2/ota/status` | STM32 → PC | ACK/NACK/状态文本 |
+| `device/stm32_iot2/heartbeat` | STM32 → PC | ESP32 心跳（OTA 期间自动抑制） |
 
 ---
 
@@ -261,30 +276,29 @@ python tests/ota_mqtt_sender.py --broker 192.168.0.3 --firmware build/STM32_AIoT
 python tests/ota_mqtt_sender.py --broker 192.168.0.3 --firmware build/STM32_AIoT_Project.bin --inter-frame-ms 50
 ```
 
-**MQTT 主题：**
-
-| 主题 | 方向 | 内容 |
-| --- | --- | --- |
-| `device/stm32_iot2/ota/cmd` | PC → STM32 | OTA 二进制帧（QoS 0） |
-| `device/stm32_iot2/ota/status` | STM32 → PC | ACK/NACK/状态文本 |
-| `device/stm32_iot2/heartbeat` | STM32 → PC | ESP32 心跳（OTA 期间自动抑制） |
-
 ---
 
-## 硬件架构
+## 构建与烧录
 
-```text
-PC (Python ota_mqtt_sender.py)
-    │  WiFi / MQTT (paho-mqtt)
-    ▼
-[MQTT Broker (Mosquitto)]
-    │  WiFi
-    ▼
-ESP32-S3 (ESP-IDF 5.5.2)
-  └─ UART1 GPIO17(TX)/GPIO18(RX) ──────────────────────► STM32F103C8T6
-                                                           ├─ USART2 PA2/PA3: ESP32 通信
-                                                           ├─ USART1 PA9/PA10: 调试输出
-                                                           └─ SPI1 PA4/PA5/PA6/PA7: W25Q32
+```bash
+# App 构建
+cd IoT2 && mkdir build && cd build
+cmake -G "Ninja" -DCMAKE_TOOLCHAIN_FILE=../arm-gcc-toolchain.cmake ..
+ninja
+
+# Bootloader 构建
+cd IoT2/Bootloader && mkdir build && cd build
+cmake -G "Ninja" -DCMAKE_TOOLCHAIN_FILE=../../arm-gcc-toolchain.cmake ..
+ninja
+
+# 烧录（STM32CubeProgrammer CLI）
+STM32_Programmer_CLI -c port=SWD -d Bootloader.bin 0x08000000
+STM32_Programmer_CLI -c port=SWD -d App.bin 0x08002000
+
+# ESP32 构建与烧录
+cd IoT2/ESP_Firmware
+idf.py build
+idf.py -p COMx flash monitor
 ```
 
 ---
