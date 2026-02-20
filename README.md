@@ -252,10 +252,10 @@ IoT2/
 
 | 任务 | 优先级 | 栈 | 功能 |
 | --- | --- | --- | --- |
-| `uart_ota_tx_task` | 6（高） | 2048 | OTA 帧出队 → UART 发送（mqtt_client_task.c） |
-| `uart_tx_task` | 5 | 2048 | 心跳发送（OTA session 期间自动抑制） |
-| `uart_rx_task` | 5 | 2048 | STM32 回复接收 → MQTT status 转发 |
-| `mqtt_heartbeat_task` | 3 | 2048 | MQTT JSON 心跳（10s 间隔） |
+| `uart_ota_tx_task` | 6（高） | 3072 | OTA 帧出队 → UART 发送（mqtt_client_task.c） |
+| `uart_tx_task` | 5 | 3072 | 心跳发送（OTA session 期间自动抑制） |
+| `uart_rx_task` | 5 | 3072 | STM32 回复接收 → MQTT status 转发 |
+| `mqtt_heartbeat_task` | 3 | 3072 | MQTT JSON 心跳（10s 间隔） |
 
 ---
 
