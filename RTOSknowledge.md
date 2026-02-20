@@ -826,6 +826,30 @@ static void Boot_JumpToApp(void)
 □ 8. USART2 收到截断帧？
       → 检查 UART2_DMA_BUF_SIZE 是否为 257（不是 256）
       → 256 会导致 DMA TC 与 IDLE 竞争
+
+□ 9. MQTT DATA 帧偶发丢失？（Phase 7）
+      → 检查 Python 是否使用 QoS 1（不是 QoS 0）
+      → 检查 info.wait_for_publish() 是否调用
+      → 查看 Mosquitto -v 日志确认 Broker 是否收到帧
+
+□ 10. Python TLS 验证失败 CERTIFICATE_VERIFY_FAILED？（Phase 7）
+      → 检查 server.crt 是否包含 IP SAN（不能只有 CN）
+      → 使用 openssl x509 -in server.crt -text | grep "Subject Alternative Name"
+      → 重新生成证书时必须用 -extensions v3_req -extfile san.cnf
+
+□ 11. OTA START 帧被拒绝（payload 长度不匹配）？（Phase 7）
+      → 检查 OTA_START_PAYLOAD_SIZE 定义（应为 48，不是 52）
+      → 验证 Python 发送的 payload：fw_size(4)+crc(4)+hmac(32)+ver(3)+rsv(1)+ts(4) = 48
+
+□ 12. ESP32 发送大帧时 STM32 收到截断？（Phase 7）
+      → 检查 ESP32 uart_driver_install 的 TX buffer 参数（应 ≥512，不是 0）
+      → TX buffer=0 时 256B 帧会被 128B FIFO 截断，触发 STM32 IDLE 误判
+
+□ 13. ESP32 随机复位，提示 stack overflow in task？（Phase 7）
+      → 检查任务栈大小是否足够（uart_ota_tx_task, uart_rx_task 需 ≥3072）
+      → 大局部变量（256B+ buffer）+ ESP_LOGI + 函数调用链会快速消耗栈
+      → 使用 uxTaskGetStackHighWaterMark() 监控栈水位
+      → Xtensa 架构寄存器窗口溢出会额外消耗栈空间
 ```
 
 ---
@@ -860,3 +884,117 @@ static void Boot_JumpToApp(void)
 ### Q5：ESP32 的 MQTT 回调为什么要 memcpy 而不是直接发送？
 
 **答：** `event->data` 指向 MQTT 库内部 ring buffer。如果在回调中调用 `uart_write_bytes`（可能涉及任务切换），MQTT 库可能在此期间用新的 TCP 包覆盖该 buffer，导致发出垃圾数据。立即 `memcpy` 到栈变量，然后通过 FreeRTOS 队列传给专用发送任务，彻底解耦数据生命周期。
+
+### Q6：MQTT QoS 0 和 QoS 1 在 OTA 场景下的实测区别是什么？（Phase 7）
+
+**答：**
+
+| QoS 级别 | 传输保证 | 实测表现（29KB 固件，247 帧） |
+|---|---|---|
+| QoS 0 | At most once（至多一次） | 偶发丢帧 1-2 个，导致 DATA 无 ACK，OTA 失败 |
+| QoS 1 | At least once（至少一次） | 全部 247 帧成功，0 丢帧 |
+
+**关键教训：** 即使在局域网环境下，QoS 0 也会因网络拥塞或 WiFi 干扰丢包。OTA 协议自身的 ACK 机制只能检测丢帧（等待超时），但无法恢复已经丢失的 MQTT 消息。使用 QoS 1 + `wait_for_publish()` 确保 Broker 确认收到后再继续，是 OTA 可靠性的关键。
+
+### Q7：为什么要同时使用 CRC32 和 HMAC-SHA256？（Phase 7）
+
+**答：**
+
+| 校验类型 | 检测能力 | 防篡改能力 | 计算成本 |
+|---|---|---|---|
+| CRC32 | 传输错误、位翻转 | 无（攻击者可重算 CRC） | 极低 |
+| HMAC-SHA256 | 完整性 + 身份验证 | 有（需共享密钥） | 中等 |
+
+CRC 只能检测**无意错误**，不能防止**恶意篡改**。HMAC 使用共享密钥签名，攻击者不知道密钥就无法伪造有效固件。两者配合实现纵深防御：
+
+- CRC32 快速校验整体完整性（END 帧时执行）
+- HMAC 防止固件注入攻击（攻击者无法生成有效签名）
+- 增量计算避免 RAM 不足（逐帧更新哈希上下文）
+
+### Q8：TLS 证书的 SAN 和 CN 字段有什么区别？（Phase 7）
+
+**答：**
+
+- **CN（Common Name）**：证书主体通用名，X.509 v1 时代用于身份验证
+- **SAN（Subject Alternative Name）**：X.509 v3 扩展字段，支持多域名/IP
+
+RFC 6125 规定 TLS 验证优先检查 SAN，CN 仅作后备。Python `ssl` 模块（OpenSSL 1.1.0+）**强制要求 SAN**，仅有 CN 会报 `CERTIFICATE_VERIFY_FAILED`。生成证书时必须用：
+
+```bash
+echo "subjectAltName=IP:192.168.0.3" > san.cnf
+openssl x509 -req ... -extensions v3_req -extfile san.cnf
+```
+
+**验证：** `openssl x509 -in server.crt -text | grep "Subject Alternative Name"`
+
+### Q9：防回滚机制如何应对重放攻击？（Phase 7）
+
+**答：** 攻击者截获旧版本固件的 OTA 数据包（包含有效的 HMAC 签名）并重放，企图降级到有漏洞的旧版本。防御措施：
+
+```c
+// OTA START 帧版本检查
+uint32_t new_ver = (major << 16) | (minor << 8) | patch;
+uint32_t cur_ver = OTA_VERSION_TO_U32(1, 0, 0);
+if (new_ver < cur_ver) {
+    ota_printf("[OTA] ERR: anti-rollback!\r\n");
+    goto cleanup;  // 拒绝旧版本
+}
+```
+
+即使 HMAC 验证通过（固件确实来自可信源），版本号检查也会拒绝降级。这是多层安全的一部分：
+
+1. **TLS** 防中间人窃听/篡改（传输层）
+2. **HMAC** 防篡改 + 身份验证（应用层）
+3. **版本比较** 防回滚攻击（业务层）
+
+### Q10：ESP32 UART TX buffer=0 和 buffer=512 的本质区别？（Phase 7）
+
+**答：**
+
+```c
+// TX buffer=0（仅硬件 FIFO，128 字节）
+uart_driver_install(UART_NUM, 512, 0, 0, NULL);
+uart_write_bytes(uart, data, 256);
+// → 只写入前 128B 到 FIFO，剩余 128B 丢弃
+// → STM32 收 128B 后 IDLE 触发，误认为帧结束
+
+// TX buffer=512（软件 ring buffer + 硬件 FIFO）
+uart_driver_install(UART_NUM, 512, 512, 0, NULL);
+uart_write_bytes(uart, data, 256);
+// → 256B 全部写入 ring buffer
+// → UART ISR 连续从 buffer 搬运到 FIFO
+// → STM32 连续收 256B，IDLE 在帧尾正确触发
+```
+
+**关键原理：** 软件 buffer 充当"缓冲池"，将大块数据分批喂给硬件 FIFO，保证连续传输无间隙。这是高速 UART 通信的标准配置。
+
+### Q11：ESP32 任务栈溢出的常见原因和调试方法？（Phase 7）
+
+**答：** Phase 7 测试中遇到 `uart_rx_task` 栈溢出崩溃。根本原因：
+
+**栈消耗来源：**
+1. **局部变量**：`rx_buf[256]` = 256 字节
+2. **函数调用链**：uart_read_bytes → mqtt_publish_status → snprintf → MQTT 库，每层约 32-64 字节
+3. **ESP_LOGI 宏**：内部格式化字符串，临时缓冲区约 128 字节
+4. **Xtensa 寄存器窗口**：函数调用时自动保存寄存器，深度 4 层约消耗 128 字节
+
+**累计：** 256 + 64×4 + 128 + 128 = 768 字节，加上其他开销，2048B 栈不足。
+
+**调试方法：**
+```c
+// 任务内添加监控代码
+UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+ESP_LOGI(TAG, "Stack remaining: %lu bytes", uxHighWaterMark);
+```
+
+- 若 < 512，说明栈接近满，应增大
+- 若 < 256，非常危险，随时溢出
+
+**修复原则：**
+- 有大局部变量（> 256B）的任务：栈 ≥ 3072
+- 深调用链（> 5 层）的任务：栈 ≥ 2560
+- **留 50% 裕量**（实际需求 2KB → 分配 3KB）
+
+**ESP32 vs STM32 栈分配差异：**
+- STM32 Cortex-M：简单调用约定，栈消耗可预测
+- ESP32 Xtensa：寄存器窗口机制，栈消耗波动大，需要更多裕量

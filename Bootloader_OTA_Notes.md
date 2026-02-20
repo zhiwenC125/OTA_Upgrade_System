@@ -14,10 +14,11 @@
 5. [OTA 状态机](#五ota-状态机)
 6. [CRC 校验机制](#六crc-校验机制)
 7. [ESP32-S3 网关（MQTT 透明桥接）](#七esp32-s3-网关mqtt-透明桥接)
-8. [回滚机制（Phase 7）](#八回滚机制phase-7)
-9. [调试中踩过的坑](#九调试中踩过的坑)
-10. [完整升级流程时序图](#十完整升级流程时序图phase-7含回滚)
-11. [面试常见问题](#十一面试常见问题)
+8. [回滚机制（Phase 6）](#八回滚机制phase-6)
+9. [安全加固（Phase 7）](#九安全加固phase-7)
+10. [调试中踩过的坑](#十调试中踩过的坑)
+11. [完整升级流程时序图](#十一完整升级流程时序图phase-7含回滚安全)
+12. [面试常见问题](#十二面试常见问题)
 
 ---
 
@@ -906,7 +907,7 @@ void vEsp32CommTask(void *pvParameters)
 
 ---
 
-## 八、回滚机制（Phase 7）
+## 八、回滚机制（Phase 6）
 
 ### 8.1 状态机
 
@@ -999,7 +1000,251 @@ void vOtaProcessTask(void *pvParameters)
 
 ---
 
-## 九、调试中踩过的坑
+## 九、安全加固（Phase 7）
+
+### 9.1 传输层安全（TLS + MQTT 认证）
+
+#### Mosquitto TLS 配置
+
+```conf
+# deploy/mosquitto/mosquitto_tls.conf
+listener 8883
+cafile   E:\IoT2\certs\ca.crt
+certfile E:\IoT2\certs\server.crt
+keyfile  E:\IoT2\certs\server.key
+tls_version tlsv1.2
+
+# MQTT 认证
+allow_anonymous false
+password_file C:\Program Files\mosquitto\passwd
+```
+
+#### 证书生成（关键：IP SAN）
+
+```bash
+# 生成 CA
+openssl genrsa -out ca.key 2048
+openssl req -new -x509 -days 3650 -key ca.key -out ca.crt -subj "/CN=IoT2_CA"
+
+# 生成服务器证书（必须包含 IP SAN，否则 Python ssl 验证失败）
+openssl genrsa -out server.key 2048
+openssl req -new -key server.key -out server.csr -subj "/CN=192.168.0.3"
+
+# 使用 san.cnf 扩展（IP SAN）
+echo "[v3_req]" > san.cnf
+echo "subjectAltName=IP:192.168.0.3" >> san.cnf
+
+MSYS_NO_PATHCONV=1 openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -out server.crt -days 3650 -extensions v3_req -extfile san.cnf
+```
+
+**关键经验：**
+- Python `ssl` 模块要求 TLS 证书必须有 SAN（Subject Alternative Name）字段
+- 仅在 CN（Common Name）中填写 IP 不足以通过验证
+- Windows Git Bash 环境需设置 `MSYS_NO_PATHCONV=1` 防止路径转换
+
+#### ESP32 TLS 客户端
+
+```c
+// mqtt_client_task.c
+extern const char ca_cert_pem[];  // 嵌入式 CA 证书（ca_cert.c）
+
+esp_mqtt_client_config_t mqtt_cfg = {
+    .broker.address.uri = "mqtts://192.168.0.3:8883",  // mqtts:// 启用 TLS
+    .broker.verification.certificate = ca_cert_pem,
+    .credentials.username = "iot2_esp32",
+    .credentials.authentication.password = "esp32_secure_2026",
+    .network.timeout_ms = 10000,
+    .buffer.size = 512,
+};
+```
+
+#### Python TLS 客户端
+
+```python
+# ota_mqtt_sender.py
+client = mqtt.Client(...)
+client.tls_set(ca_certs="certs/ca.crt")
+client.username_pw_set("iot2_sender", "sender_secure_2026")
+client.connect("192.168.0.3", 8883)
+```
+
+### 9.2 固件完整性（HMAC-SHA256）
+
+#### 增量 HMAC 计算
+
+STM32 逐帧更新 HMAC，避免一次性载入整个固件到 RAM（20KB 限制）：
+
+```c
+// ota_task.c
+static HMAC_SHA256_CTX s_hmac_ctx;
+static const uint8_t s_ota_hmac_key[32] = {
+    0x49, 0x6F, 0x54, 0x32, 0x2D, 0x4F, 0x54, 0x41,  // "IoT2-OTA"
+    0x2D, 0x48, 0x4D, 0x41, 0x43, 0x2D, 0x4B, 0x65,  // "-HMAC-Ke"
+    0x79, 0x2D, 0x32, 0x30, 0x32, 0x36, 0x00, 0x00,  // "y-2026\0\0"
+    /* ... */
+};
+
+// START 帧处理
+case CMD_OTA_START:
+    memcpy(s_expected_hmac, &payload[8], 32);  // 提取 HMAC
+    hmac_sha256_init(&s_hmac_ctx, s_ota_hmac_key, 32);
+    break;
+
+// DATA 帧处理
+case CMD_OTA_DATA:
+    W25Qxx_Write(addr, payload, len);
+    s_running_crc = crc32_update(s_running_crc, payload, len);
+    hmac_sha256_update(&s_hmac_ctx, payload, len);  // ← 增量更新
+    break;
+
+// END 帧处理
+case CMD_OTA_END:
+    uint8_t computed_hmac[32];
+    hmac_sha256_final(&s_hmac_ctx, computed_hmac);
+    if (memcmp(computed_hmac, s_expected_hmac, 32) != 0) {
+        ota_printf("[OTA] ERR: HMAC mismatch! Firmware rejected.\r\n");
+        goto cleanup;
+    }
+    ota_printf("[OTA] HMAC-SHA256 OK\r\n");
+    break;
+```
+
+**双重校验机制：**
+| 校验类型 | 时机 | 作用 |
+|---|---|---|
+| CRC16-CCITT | 每帧 | 检测传输错误（位翻转） |
+| CRC32 IEEE 802.3 | END 帧 | 整体完整性校验 |
+| HMAC-SHA256 | END 帧 | 防篡改 + 身份验证（共享密钥） |
+
+### 9.3 防回滚机制
+
+#### 版本号定义
+
+```c
+// ota_meta.c
+uint8_t OTA_CURRENT_VERSION_MAJOR = 1;
+uint8_t OTA_CURRENT_VERSION_MINOR = 0;
+uint8_t OTA_CURRENT_VERSION_PATCH = 0;
+
+#define OTA_VERSION_TO_U32(maj, min, pat) \
+    (((uint32_t)(maj) << 16) | ((uint32_t)(min) << 8) | (uint32_t)(pat))
+```
+
+#### START 帧版本检查
+
+```c
+// ota_task.c — CMD_OTA_START 处理
+s_new_ver[0] = payload[40];  // major
+s_new_ver[1] = payload[41];  // minor
+s_new_ver[2] = payload[42];  // patch
+
+uint32_t new_v = OTA_VERSION_TO_U32(s_new_ver[0], s_new_ver[1], s_new_ver[2]);
+uint32_t cur_v = OTA_VERSION_TO_U32(OTA_CURRENT_VERSION_MAJOR,
+                                    OTA_CURRENT_VERSION_MINOR,
+                                    OTA_CURRENT_VERSION_PATCH);
+
+if (new_v < cur_v) {
+    ota_printf("[OTA] ERR: anti-rollback! new=%u.%u.%u < current=%u.%u.%u\r\n",
+               s_new_ver[0], s_new_ver[1], s_new_ver[2],
+               OTA_CURRENT_VERSION_MAJOR, OTA_CURRENT_VERSION_MINOR,
+               OTA_CURRENT_VERSION_PATCH);
+    goto cleanup;  // 拒绝旧版本固件
+}
+```
+
+#### 固件元数据（W25Q32 Meta 区）
+
+```c
+// ota_meta.h
+typedef struct {
+    uint32_t magic;           // 0x4F54414D ("OTAM")
+    uint8_t  version_major;
+    uint8_t  version_minor;
+    uint8_t  version_patch;
+    uint8_t  meta_version;
+    uint32_t build_timestamp;
+    uint32_t fw_size;
+    uint32_t fw_crc32;
+    uint8_t  hmac[32];
+} OTA_Meta_t;
+
+// ota_task.c — CMD_OTA_END
+OTA_Meta_t meta;
+meta.magic = OTA_META_MAGIC;
+meta.version_major = s_new_ver[0];
+meta.version_minor = s_new_ver[1];
+meta.version_patch = s_new_ver[2];
+meta.build_timestamp = s_build_ts;
+meta.fw_size = s_fw_total_size;
+meta.fw_crc32 = s_fw_crc32;
+memcpy(meta.hmac, s_expected_hmac, 32);
+OTA_Meta_Write(&meta);  // 写入 W25Q32 0x020000
+```
+
+#### Bootloader 读取元数据
+
+```c
+// Bootloader/main.c
+OTA_Meta_t meta;
+Boot_W25Q_Read(W25QXX_OTA_META_ADDR, (uint8_t *)&meta, sizeof(meta));
+
+if (meta.magic == OTA_META_MAGIC) {
+    Boot_Print("[BOOT] Meta: ver=");
+    Boot_PrintU32(meta.version_major); Boot_PutChar('.');
+    Boot_PrintU32(meta.version_minor); Boot_PutChar('.');
+    Boot_PrintU32(meta.version_patch);
+    Boot_Print(", ts=");
+    Boot_PrintU32(meta.build_timestamp);
+    Boot_Print("\r\n");
+}
+```
+
+### 9.4 MQTT QoS 修复（关键 Bug）
+
+**问题：** 使用 QoS 0 发送 OTA 帧时，247 个 DATA 帧中偶发丢帧，导致 STM32 无响应。
+
+**根因：** QoS 0 = "at most once"，即使在 LAN 环境下也会因网络拥塞丢包。
+
+**修复：** 改用 QoS 1 + `wait_for_publish()` 确认：
+
+```python
+# ota_mqtt_sender.py（修复前）
+self.client.publish(MQTT_TOPIC_OTA_CMD, payload=frame, qos=0)  # ❌ 偶发丢帧
+
+# ota_mqtt_sender.py（修复后）
+info = self.client.publish(MQTT_TOPIC_OTA_CMD, payload=frame, qos=1)
+info.wait_for_publish(timeout=5)  # ✅ 等待 Broker 确认
+if not info.is_published():
+    print(f"[WARN] MQTT publish NOT confirmed!")
+```
+
+**效果：** 29604 字节固件（247 个 DATA 帧）全部成功传输，无丢帧。
+
+### 9.5 OTA 协议 v3（Phase 7）
+
+START payload 从 8 字节扩展到 48 字节：
+
+```text
+[fw_size:4 BE][fw_crc32:4 BE][hmac_sha256:32][ver_major:1][ver_minor:1][ver_patch:1][rsv:1][timestamp:4 BE]
+
+Offset  | Field          | Size | Description
+--------|----------------|------|------------------
+0-3     | fw_size        | 4    | 固件大小（大端序）
+4-7     | fw_crc32       | 4    | 固件 CRC32（大端序）
+8-39    | hmac_sha256    | 32   | HMAC-SHA256 签名
+40      | version_major  | 1    | 版本号（主版本）
+41      | version_minor  | 1    | 版本号（次版本）
+42      | version_patch  | 1    | 版本号（补丁版本）
+43      | reserved       | 1    | 保留字段
+44-47   | build_timestamp| 4    | 构建时间戳（Unix time，大端序）
+```
+
+**重要：** `OTA_START_PAYLOAD_SIZE = 48`（不是 52）
+
+---
+
+## 十、调试中踩过的坑
 
 ### 坑 1：SysTick_Handler 是弱符号，1ms 后死机
 
@@ -1184,9 +1429,150 @@ void USART1_IRQHandler(void)
 }
 ```
 
+### 坑 9：MQTT QoS 0 导致 DATA 帧偶发丢失（Phase 7）
+
+**现象：** START 帧正常 (READY)，但 DATA seq=0 无响应，Python 超时显示 `''` 空字符串。
+
+**调试过程：**
+1. 怀疑 ESP32 UART TX FIFO 截断（256B 帧 > 128B FIFO）
+2. 修改 `--chunk-size 120` 使帧恰好 128B 适配 FIFO → 依然失败
+3. 查看 Mosquitto -v 日志 → 发现 Broker 有时未收到 DATA 帧
+4. 检查 Python publish 返回值 → QoS 0 无确认机制
+
+**根本原因：** MQTT QoS 0 = "至多一次"，即使 LAN 环境也会因网络拥塞丢包。
+
+**修复（`ota_mqtt_sender.py`）：**
+```python
+# 修复前
+self.client.publish(MQTT_TOPIC_OTA_CMD, payload=frame, qos=0)  # ❌
+
+# 修复后
+info = self.client.publish(MQTT_TOPIC_OTA_CMD, payload=frame, qos=1)
+info.wait_for_publish(timeout=5)  # 等待 Broker PUBACK
+if not info.is_published():
+    print(f"[WARN] MQTT publish NOT confirmed!")
+```
+
+**效果：** 29604 字节（247 帧）全部传输成功，0 丢帧。
+
+### 坑 10：TLS 证书缺少 IP SAN 导致 Python ssl 验证失败（Phase 7）
+
+**现象：** Python 客户端报错 `CERTIFICATE_VERIFY_FAILED`，但 ESP32 连接正常。
+
+**根本原因：**
+- OpenSSL 1.1.0+ 要求 TLS 证书必须包含 SAN（Subject Alternative Name）
+- 仅在 CN（Common Name）字段填写 IP 不足以通过验证
+- ESP32 mbedTLS 默认配置较宽松，未强制要求 SAN
+
+**修复（证书重新生成）：**
+```bash
+# 创建 SAN 扩展配置
+echo "[v3_req]" > san.cnf
+echo "subjectAltName=IP:192.168.0.3" >> san.cnf
+
+# 使用 -extensions v3_req -extfile san.cnf
+MSYS_NO_PATHCONV=1 openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -out server.crt -days 3650 -extensions v3_req -extfile san.cnf
+
+# 验证 SAN
+openssl x509 -in server.crt -text -noout | grep "Subject Alternative Name" -A 1
+# 输出: X509v3 Subject Alternative Name: IP Address:192.168.0.3
+```
+
+### 坑 11：OTA_START_PAYLOAD_SIZE 定义错误导致 START 拒绝（Phase 7）
+
+**现象：** Python 发送 START 帧（56 字节总长，48 字节 payload），STM32 响应：
+```
+[OTA] ERR: START needs 52-byte payload, got 48
+```
+
+**根本原因：** 头文件中 `OTA_START_PAYLOAD_SIZE = 52U`，但实际计算：
+```
+fw_size(4) + fw_crc32(4) + hmac(32) + ver(3) + rsv(1) + timestamp(4) = 48 字节
+```
+
+**修复（`ota_task.h`）：**
+```c
+// 修复前
+#define OTA_START_PAYLOAD_SIZE   52U   // ❌ 错误
+
+// 修复后
+#define OTA_START_PAYLOAD_SIZE   48U   // ✅ fw_size(4)+crc(4)+hmac(32)+ver(3)+rsv(1)+ts(4)
+```
+
+### 坑 12：ESP32 UART TX buffer=0 导致大帧被截断（Phase 7）
+
+**现象：** 256B OTA 帧在 STM32 侧触发 IDLE 中断时只收到前 128B。
+
+**根本原因：**
+```c
+// hello_world_main.c（修复前）
+uart_driver_install(STM32_UART_NUM, 512, 0, 0, NULL);
+                                        ↑
+                                    TX buffer = 0
+```
+TX buffer=0 时，`uart_write_bytes(256B)` 只能写满 128B 的硬件 FIFO，剩余 128B 被丢弃。
+
+**修复：**
+```c
+// hello_world_main.c（修复后）
+uart_driver_install(STM32_UART_NUM, 512, 512, 0, NULL);
+                                        ↑    ↑
+                                   RX buf  TX buf (512B ring buffer)
+```
+
+有了 TX ring buffer，256B 帧一次性写入缓冲区，UART 硬件 DMA 连续搬运，STM32 不会误检测 IDLE 把帧截断。
+
+### 坑 13：ESP32 FreeRTOS 任务栈溢出导致崩溃（Phase 7）
+
+**现象：** OTA 测试时 ESP32 随机复位，串口监控显示：
+```
+***ERROR*** A stack overflow in task uart_rx has been detected.
+abort() was called at PC 0x4037c3bb on core 0
+Guru Meditation Error: Core 0 panic'ed (abort).
+```
+
+**根本原因：**
+
+| 任务 | 栈上大变量 | 叠加开销 | 修复前栈大小 |
+|---|---|---|---|
+| `uart_ota_tx_task` | `ota_tx_item_t` 258B | ESP_LOGI + uart_write_bytes 调用链 | 2048B ❌ |
+| `uart_rx_task` | `rx_buf[256]` | ESP_LOGI + strstr + mqtt_publish_* | 2048B ❌ |
+
+ESP-IDF 的 Xtensa 架构有**寄存器窗口溢出**机制，函数调用深度增加时会额外消耗栈空间。心跳阶段调用链浅（uart_write_bytes → 返回），刚好不溢出。**OTA 触发后**：
+
+- `uart_ota_tx_task` 开始工作：258B item + ESP_LOGI 格式化 + uart_wait_tx_done + 寄存器窗口溢出 → 超过 2048B
+- `uart_rx_task` 收到 ACK 数据：256B rx_buf + mqtt_publish_status（内部 snprintf + MQTT 库调用） → 超过 2048B
+
+**修复（`hello_world_main.c`）：**
+```c
+// 修复前
+xTaskCreate(uart_ota_tx_task, "ota_uart_tx", 2048, NULL, 6, NULL);  // ❌ 栈溢出
+xTaskCreate(uart_rx_task, "uart_rx", 2048, NULL, 5, NULL);          // ❌ 栈溢出
+
+// 修复后
+xTaskCreate(uart_ota_tx_task, "ota_uart_tx", 3072, NULL, 6, NULL);  // ✅ 足够裕量
+xTaskCreate(uart_rx_task, "uart_rx", 3072, NULL, 5, NULL);          // ✅ 足够裕量
+```
+
+**验证方法：**
+```c
+// 任务中添加栈使用监控（开发阶段）
+UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+ESP_LOGI(TAG, "Task stack high water mark: %lu bytes", uxHighWaterMark);
+// 若 < 512，说明裕量不足，应增大栈
+```
+
+**关键教训：** ESP32 栈空间分配要考虑：
+1. 局部变量大小（尤其是数组/结构体）
+2. 函数调用链深度（每层调用约消耗 32-64 字节）
+3. ESP_LOG* 宏的格式化开销
+4. Xtensa 寄存器窗口溢出额外消耗
+5. **留 50% 裕量**（2KB 变量 → 至少 3KB 栈）
+
 ---
 
-## 十、完整升级流程时序图（Phase 7，含回滚）
+## 十一、完整升级流程时序图（Phase 7，含回滚+安全）
 
 ```text
 PC (ota_mqtt_sender.py)   ESP32-S3      STM32 App (ota_task v4.0)   Bootloader
@@ -1277,9 +1663,9 @@ PC (ota_mqtt_sender.py)   ESP32-S3      STM32 App (ota_task v4.0)   Bootloader
 - 下行：接收 STM32 的 ACK/状态文本 → 发布到 MQTT 状态主题
 - ESP32 不解析 OTA 协议内容，只做数据搬运，解耦网络层和固件升级逻辑
 
-### Q7：为什么 MQTT 用 QoS 0 而不是 QoS 1/2？
+### Q7：Phase 7 修复后，为什么 MQTT OTA 改用 QoS 1？
 
-**答：** OTA 协议自身已有 ACK/重传机制（通过 Python 侧超时重发）。QoS 1/2 会导致 Broker 重传旧帧，而 STM32 状态机已推进到新序号，重传帧会因序号不匹配被 NACK，反而干扰正常流程。
+**答：** Phase 6 时使用 QoS 0，但实测发现即使在 LAN 环境下也会因网络拥塞偶发丢帧（247 个 DATA 帧中有 1-2 个丢失）。QoS 0 = "至多一次"，无确认机制。Phase 7 改用 QoS 1 + `wait_for_publish()` 确保每帧都收到 Broker PUBACK 确认，29604 字节固件（247 帧）全部传输成功，0 丢帧。OTA 协议自身的 ACK 机制用于校验数据正确性（序号、CRC16），MQTT QoS 1 用于保证传输可靠性（不丢包），两者配合实现端到端可靠传输。
 
 ### Q8：`goto cleanup` 模式的作用是什么？
 
@@ -1288,3 +1674,70 @@ PC (ota_mqtt_sender.py)   ESP32-S3      STM32 App (ota_task v4.0)   Bootloader
 1. 遗忘释放锁导致死锁
 2. 多个 return 分支重复写释放代码
 3. 这是嵌入式 C 中常见的资源管理模式（类似 Linux 内核风格）
+
+### Q9：HMAC-SHA256 和 CRC32 都是校验，为什么要同时使用？（Phase 7）
+
+**答：**
+
+| 校验类型 | 作用 | 能否防篡改 |
+|---|---|---|
+| CRC16-CCITT | 检测传输错误（位翻转、丢包） | 否（攻击者可重新计算 CRC） |
+| CRC32 IEEE 802.3 | 整体完整性校验 | 否 |
+| HMAC-SHA256 | 防篡改 + 身份验证 | 是（需要共享密钥） |
+
+CRC 只能检测**无意错误**（噪声、干扰），不能防止**恶意篡改**。攻击者可以修改固件后重新计算 CRC。HMAC 使用共享密钥签名，攻击者不知道密钥就无法伪造有效的 HMAC，因此能防止固件注入攻击。两者配合：CRC 保证传输可靠性，HMAC 保证固件来源可信。
+
+### Q10：为什么使用增量 HMAC 而不是一次性计算？（Phase 7）
+
+**答：** STM32F103 只有 20KB RAM，固件大小约 30KB，无法一次性载入内存计算 HMAC。增量 HMAC 逐帧更新哈希上下文：
+
+```c
+hmac_sha256_init(&ctx, key, 32);           // START 时初始化
+hmac_sha256_update(&ctx, chunk, len);     // 每个 DATA 帧更新
+hmac_sha256_final(&ctx, digest);          // END 时输出最终摘要
+```
+
+每次 `update` 只处理当前 DATA 帧的 120-248 字节，不占用大量 RAM。这是流式哈希（streaming hash）的经典应用场景。
+
+### Q11：防回滚机制如何实现？如果攻击者重放旧版本固件会怎样？（Phase 7）
+
+**答：** OTA START 帧携带新固件版本号（major.minor.patch），STM32 与当前运行版本比较：
+
+```c
+uint32_t new_ver = (major << 16) | (minor << 8) | patch;
+uint32_t cur_ver = OTA_VERSION_TO_U32(1, 0, 0);
+if (new_ver < cur_ver) {
+    ota_printf("[OTA] ERR: anti-rollback!\r\n");
+    goto cleanup;  // 拒绝旧版本
+}
+```
+
+即使攻击者重放旧版本固件（包含有效的 HMAC 签名），STM32 也会在 START 阶段检测版本号过低而拒绝。防回滚保护是多层安全的一部分：
+
+1. HMAC 防篡改（确保固件来自可信源）
+2. 版本比较防回滚（确保不会降级到有漏洞的旧版本）
+3. TLS 防中间人（确保传输过程不被窃听/篡改）
+
+### Q12：TLS 证书为什么必须包含 IP SAN？CN 字段不够吗？（Phase 7）
+
+**答：** RFC 6125 和 RFC 2818 规定，TLS 证书验证时优先检查 SAN（Subject Alternative Name）字段，CN（Common Name）仅作为后备。Python `ssl` 模块（基于 OpenSSL 1.1.0+）强制要求 SAN，仅有 CN 会报 `CERTIFICATE_VERIFY_FAILED`。
+
+生成证书时需要用 `-extensions v3_req -extfile san.cnf` 添加 SAN：
+
+```bash
+echo "subjectAltName=IP:192.168.0.3" > san.cnf
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
+  -out server.crt -extensions v3_req -extfile san.cnf
+```
+
+验证：`openssl x509 -in server.crt -text | grep "Subject Alternative Name"`
+
+### Q13：ESP32 UART TX buffer=0 会导致什么问题？（Phase 7）
+
+**答：** `uart_driver_install(UART_NUM, rx_buf, 0, ...)` 的 TX buffer=0 表示不创建软件发送缓冲区，只使用硬件 FIFO（ESP32-S3 UART FIFO = 128 字节）。发送 256 字节 OTA 帧时：
+
+- 第一次 `uart_write_bytes` 只能写满 128B FIFO，返回 128
+- 剩余 128B 被**直接丢弃**（无软件缓冲区存储）
+- STM32 收到前 128B 后触发 IDLE 中断，误认为帧结束 → 帧被截断
+
+修复：设置 TX buffer ≥ 512 字节，256B 帧一次性写入缓冲区，UART 硬件连续搬运，不会产生间隙触发 STM32 IDLE。

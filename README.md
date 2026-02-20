@@ -17,8 +17,8 @@
 | Phase 3 | Bootloader（SPI 读取 + 固件拷贝 + 跳转） | ✅ 完成 |
 | Phase 4 | OTA Task 完整实现（协议 + 状态机 + CRC32） | ✅ 完成 |
 | Phase 5 | ESP32-S3 WiFi/MQTT 透明桥接网关 | ✅ 完成 |
-| Phase 6 | 端到端测试（MQTT→ESP32→STM32→W25Q32→Bootloader） | ✅ 完成 |
-| Phase 7 | 回滚机制（BOOT_COUNTING + W25Q32 Backup 区） | ✅ 完成 |
+| Phase 6 | 回滚机制（BOOT_COUNTING + W25Q32 Backup 区） | ✅ 完成 |
+| Phase 7 | 安全加固（TLS + MQTT 认证 + HMAC-SHA256 签名 + 防回滚） | ✅ 完成 |
 
 ---
 
@@ -26,9 +26,11 @@
 
 ```text
 PC (Python ota_mqtt_sender.py)
-    │  WiFi / MQTT (paho-mqtt, QoS 0)
+    │  WiFi / MQTT TLS (paho-mqtt, QoS 1)
     ▼
-[MQTT Broker (Mosquitto)]         ← 局域网 192.168.0.3
+[MQTT Broker (Mosquitto TLS:8883)]  ← 局域网 192.168.0.3
+    │  认证: username/password
+    │  加密: TLSv1.2 + CA 证书验证
     │  WiFi
     ▼
 ESP32-S3 (ESP-IDF 5.5.2)
@@ -60,8 +62,9 @@ ESP32-S3 (ESP-IDF 5.5.2)
 | T4 | 完整 OTA 流程（USART1 直连） | 真实固件传输，CRC32 OK，新固件启动 | ✅ PASS |
 | T5 | MQTT 端到端 OTA（Python→MQTT→ESP32→STM32） | v3.0→v4.0 固件升级，BOOT_COUNTING→CONFIRMED | ✅ PASS |
 | T6 | 回滚机制（假固件 → 3次失败 → 自动回滚） | count=03 触发回滚，从 Backup 恢复，旧固件运行 | ✅ PASS |
+| T7 | TLS + HMAC + 防回滚（Python→MQTT(TLS)→STM32） | 29KB 真实固件，247 帧全部 ACK，HMAC 校验通过，版本 1.0.0→1.0.1 | ✅ PASS |
 
-**T5/T6 关键输出节选：**
+**T5/T6/T7 关键输出节选：**
 
 ```text
 [BOOT] Flag -> BOOT_COUNTING(1)            ← T5: 新固件首次启动
@@ -72,6 +75,12 @@ ESP32-S3 (ESP-IDF 5.5.2)
 [BOOT] Too many failed boots! Rolling back ← T6: 触发回滚
 [BOOT] Rollback complete. Flag -> CONFIRMED
 [OTA] Task started v4.0.                  ← T6: 旧固件恢复运行
+
+[OTA] START: fw_size=29604, CRC32=0xC1C65F82, ver=1.0.1  ← T7: Phase 7 协议
+[OTA] ACK seq=0 (120/29604 bytes)         ← T7: QoS 1 全帧成功
+[OTA] HMAC-SHA256 OK                      ← T7: 签名校验
+[OTA] Meta written (ver=1.0.1)            ← T7: 版本记录
+[BOOT] Meta: ver=1.0.1, ts=2026-02-20     ← T7: Bootloader 读取元数据
 ```
 
 ---
@@ -155,7 +164,9 @@ SEQ  : 包序号（大端序，从 0 递增）
 LEN  : PAYLOAD 字节数（大端序）
 CRC16: CRC16-CCITT，覆盖 [CMD..PAYLOAD]
 
-START payload (8 bytes): [fw_size:4][fw_crc32:4] 大端序
+START payload (48 bytes, Phase 7 v3 协议):
+  [fw_size:4][fw_crc32:4][hmac_sha256:32][ver_major:1][ver_minor:1][ver_patch:1][rsv:1][timestamp:4]
+
 DATA  payload (1~248 bytes): 固件原始数据
 END   payload: 空
 ```
@@ -250,11 +261,11 @@ IoT2/
 
 ## MQTT 主题
 
-| 主题 | 方向 | 内容 |
-| --- | --- | --- |
-| `device/stm32_iot2/ota/cmd` | PC → STM32 | OTA 二进制帧（QoS 0） |
-| `device/stm32_iot2/ota/status` | STM32 → PC | ACK/NACK/状态文本 |
-| `device/stm32_iot2/heartbeat` | STM32 → PC | ESP32 心跳（OTA 期间自动抑制） |
+| 主题 | 方向 | 内容 | QoS |
+| --- | --- | --- | --- |
+| `device/stm32_iot2/ota/cmd` | PC → STM32 | OTA 二进制帧（HMAC 签名） | QoS 1（Phase 7 修复） |
+| `device/stm32_iot2/ota/status` | STM32 → PC | ACK/NACK/状态文本 | QoS 1 |
+| `device/stm32_iot2/heartbeat` | STM32 → PC | ESP32 心跳（OTA 期间自动抑制） | QoS 0 |
 
 ---
 
@@ -263,17 +274,22 @@ IoT2/
 依赖：`pip install paho-mqtt`，需要 MQTT Broker（如 Mosquitto）在局域网运行。
 
 ```bash
+# Phase 7: TLS + 认证（推荐，生产环境）
+python tests/ota_mqtt_sender.py --broker 192.168.0.3 \
+  --tls-ca certs/ca.crt --mqtt-user iot2_sender --mqtt-pass sender_secure_2026 \
+  --firmware build/STM32_AIoT_Project.bin --fw-version 1.0.1
+
+# 明文测试（仅限 localhost 调试）
+python tests/ota_mqtt_sender.py --broker 127.0.0.1 --mqtt-port 1883 \
+  --firmware build/STM32_AIoT_Project.bin
+
 # 协议状态机测试（假固件 1KB）
-python tests/ota_mqtt_sender.py --broker 192.168.0.3 --test-protocol
+python tests/ota_mqtt_sender.py --broker 192.168.0.3 --tls-ca certs/ca.crt \
+  --mqtt-user iot2_sender --mqtt-pass sender_secure_2026 --test-protocol
 
 # 错误注入测试（CRC16 / 序号跳变 / ABORT 恢复）
-python tests/ota_mqtt_sender.py --broker 192.168.0.3 --test-error-injection
-
-# 完整 OTA（真实固件）
-python tests/ota_mqtt_sender.py --broker 192.168.0.3 --firmware build/STM32_AIoT_Project.bin
-
-# 调整帧间延迟（默认 100ms）
-python tests/ota_mqtt_sender.py --broker 192.168.0.3 --firmware build/STM32_AIoT_Project.bin --inter-frame-ms 50
+python tests/ota_mqtt_sender.py --broker 192.168.0.3 --tls-ca certs/ca.crt \
+  --mqtt-user iot2_sender --mqtt-pass sender_secure_2026 --test-error-injection
 ```
 
 ---
@@ -303,9 +319,63 @@ idf.py -p COMx flash monitor
 
 ---
 
+## Phase 7 安全特性详解
+
+### 传输层安全（TLS）
+
+```bash
+# Mosquitto TLS 配置（deploy/mosquitto/mosquitto_tls.conf）
+listener 8883
+cafile   E:\IoT2\certs\ca.crt
+certfile E:\IoT2\certs\server.crt
+keyfile  E:\IoT2\certs\server.key
+tls_version tlsv1.2
+allow_anonymous false
+password_file C:\Program Files\mosquitto\passwd
+```
+
+- ESP32 使用 mbedTLS 验证服务器证书
+- Python 使用 OpenSSL 验证服务器证书
+- **关键经验**: TLS 证书必须包含 IP SAN（Subject Alternative Name），仅 CN 字段不足
+
+### 固件完整性（HMAC-SHA256）
+
+```c
+// 发送端（Python）
+hmac_digest = hmac.new(OTA_HMAC_KEY, fw_data, hashlib.sha256).digest()  // 32 字节
+
+// 接收端（STM32）
+hmac_sha256_init(&s_hmac_ctx, s_ota_hmac_key, 32);
+// DATA 帧逐帧更新
+hmac_sha256_update(&s_hmac_ctx, payload, len);
+// END 时验证
+hmac_sha256_final(&s_hmac_ctx, computed_hmac);
+if (memcmp(computed_hmac, expected_hmac, 32) != 0) → 拒绝
+```
+
+### 防回滚机制
+
+```c
+// OTA START 时检查版本号
+uint32_t new_ver = (major << 16) | (minor << 8) | patch;
+uint32_t cur_ver = OTA_VERSION_TO_U32(1, 0, 0);
+if (new_ver < cur_ver) {
+    ota_printf("[OTA] ERR: anti-rollback! new=%u.%u.%u < current\r\n");
+    goto cleanup;  // 拒绝旧版本固件
+}
+```
+
+### MQTT 认证
+
+```bash
+# Mosquitto 密码文件创建
+mosquitto_passwd -c "C:\Program Files\mosquitto\passwd" iot2_esp32
+mosquitto_passwd -b "C:\Program Files\mosquitto\passwd" iot2_sender sender_secure_2026
+```
+
 ## 下一步（可选）
 
+- [x] Phase 7：安全加固（TLS + MQTT 认证 + HMAC-SHA256 + 防回滚）✅
 - [ ] Phase 8：IWDG 硬件看门狗联动（检测运行中崩溃，触发 boot_count 累加）
-- [ ] Phase 9：固件版本信息嵌入（Meta 区 + MQTT 版本上报）
-- [ ] Phase 10：远程诊断（FreeRTOS 堆/任务状态定时上报 MQTT）
-- [ ] Phase 11：固件签名验证（ECDSA，防止非法固件注入）
+- [ ] Phase 9：远程诊断（FreeRTOS 堆/任务状态定时上报 MQTT）
+- [ ] Phase 10：多设备管理（MQTT 通配符订阅 + 设备 ID 路由）
