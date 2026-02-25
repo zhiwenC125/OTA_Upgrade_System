@@ -1,0 +1,33 @@
+#ifndef MQTT_CONFIG_H
+#define MQTT_CONFIG_H
+
+/* ============================================================================
+ * MQTT 配置
+ *
+ * 复制此文件为 mqtt_config.h 并修改 MQTT_BROKER_URI 为你的 Broker IP。
+ * 确保 Broker 已启动且已配置 TLS + 密码认证。
+ * ============================================================================ */
+
+#define MQTT_BROKER_URI     "mqtts://192.168.x.x:8883"  /* TLS 加密连接 */
+
+#define MQTT_DEVICE_ID      "stm32_iot2"
+
+/* MQTT 认证（Broker 已启用 password_file，禁止匿名连接） */
+#define MQTT_USERNAME       "your_mqtt_username"
+#define MQTT_PASSWORD       "your_mqtt_password"
+
+/* MQTT 主题定义 */
+#define MQTT_TOPIC_OTA_CMD      "device/" MQTT_DEVICE_ID "/ota/cmd"
+#define MQTT_TOPIC_OTA_STATUS   "device/" MQTT_DEVICE_ID "/ota/status"
+#define MQTT_TOPIC_HEARTBEAT    "device/" MQTT_DEVICE_ID "/heartbeat"
+#define MQTT_TOPIC_SENSOR       "device/" MQTT_DEVICE_ID "/sensor/data"
+#define MQTT_TOPIC_ALERT        "device/" MQTT_DEVICE_ID "/sensor/alert"
+
+/* QoS: OTA 用 1（至少一次），心跳用 0 */
+#define MQTT_OTA_QOS        1
+#define MQTT_HB_QOS         0
+
+/* 心跳间隔（毫秒） */
+#define MQTT_HEARTBEAT_INTERVAL_MS  10000
+
+#endif /* MQTT_CONFIG_H */

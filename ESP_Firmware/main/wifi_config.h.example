@@ -1,0 +1,17 @@
+#ifndef WIFI_CONFIG_H
+#define WIFI_CONFIG_H
+
+/* ============================================================================
+ * WiFi 配置（站点模式）
+ *
+ * 复制此文件为 wifi_config.h 并修改以下宏为你的路由器信息。
+ * 后续可改为从 NVS 读取或通过 SmartConfig 配网。
+ * ============================================================================ */
+
+#define WIFI_SSID           "your_wifi_ssid"
+#define WIFI_PASSWORD       "your_wifi_password"
+
+/* 断线重连参数 */
+#define WIFI_MAX_RETRY      10
+
+#endif /* WIFI_CONFIG_H */

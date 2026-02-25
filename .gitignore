@@ -68,6 +68,27 @@ Release/
 # ─── STM32CubeProgrammer 临时文件 ─────────────────────────
 *.rfu
 
+# ─── 个人文件（简历/面试笔记） ──────────────────────────────
+CV.*
+CVes.*
+CVes_revised.*
+INTERVIEW_GUIDE.md
+RESUME_DESCRIPTION.md
+RESUME_QUICK_COPY.md
+DOCS_INDEX.md
+Bootloader_OTA_Notes.md
+RTOSknowledge.md
+
+# ─── 敏感配置（证书/密码） ──────────────────────────────────
+certs/
+ESP_Firmware/main/wifi_config.h
+ESP_Firmware/main/mqtt_config.h
+deploy/mosquitto/setup_broker.sh
+deploy/mosquitto/setup_broker.bat
+
+# ─── Windows 保留文件名（误创建） ──────────────────────────
+**/nul
+
 # ─── 系统文件 ─────────────────────────────────────────────
 desktop.ini
 ehthumbs.db
