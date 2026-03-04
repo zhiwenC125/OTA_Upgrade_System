@@ -19,6 +19,8 @@
 | Phase 5 | ESP32-S3 WiFi/MQTT 透明桥接网关 | ✅ 完成 |
 | Phase 6 | 回滚机制（BOOT_COUNTING + W25Q32 Backup 区） | ✅ 完成 |
 | Phase 7 | 安全加固（TLS + MQTT 认证 + HMAC-SHA256 签名 + 防回滚） | ✅ 完成 |
+| Phase 8 | IWDG 硬件看门狗（运行时崩溃检测 + Bootloader 联动喂狗） | ✅ 完成 |
+| Phase 9 | 远程诊断（MQTT 实时上报诊断数据 + Python 监控脚本） | ✅ 完成 |
 
 ---
 
@@ -220,7 +222,8 @@ IoT2/
 └── tests/
     ├── ota_mqtt_sender.py                  MQTT OTA 发送器（协议/错误/完整测试）
     ├── ota_sender.py                       串口直连 OTA 发送器
-    └── diag_serial.py                      串口诊断工具
+    ├── diag_serial.py                      串口诊断工具
+    └── diag_monitor.py                     MQTT 远程诊断监控（Phase 9）
 ```
 
 ---
@@ -266,6 +269,9 @@ IoT2/
 | `device/stm32_iot2/ota/cmd` | PC → STM32 | OTA 二进制帧（HMAC 签名） | QoS 1（Phase 7 修复） |
 | `device/stm32_iot2/ota/status` | STM32 → PC | ACK/NACK/状态文本 | QoS 1 |
 | `device/stm32_iot2/heartbeat` | STM32 → PC | ESP32 心跳（OTA 期间自动抑制） | QoS 0 |
+| `device/stm32_iot2/sensor/data` | STM32 → PC | 传感器 JSON（温湿度 + 平均值） | QoS 0 |
+| `device/stm32_iot2/sensor/alert` | STM32 → PC | 阈值告警 JSON | QoS 1 |
+| `device/stm32_iot2/diagnostics` | STM32 → PC | 远程诊断 JSON（~30s 周期） | QoS 0 |
 
 ---
 
@@ -373,9 +379,67 @@ mosquitto_passwd -c "C:\Program Files\mosquitto\passwd" iot2_esp32
 mosquitto_passwd -b "C:\Program Files\mosquitto\passwd" iot2_sender sender_secure_2026
 ```
 
+## Phase 9 远程诊断
+
+### 诊断 JSON 格式（STM32 → MQTT，~30s 周期）
+
+```json
+{
+  "type": "diag",
+  "up": 3600,           // 系统运行时间（秒）
+  "heap": 2048,         // FreeRTOS 空闲堆（字节）
+  "tasks": 5,           // 当前任务数
+  "ota": 0,             // OTA session 状态（0=idle, 1=active）
+  "wdog": 1,            // IWDG 看门狗（1=已启用）
+  "s_hwm": 48,          // Sensor 任务栈高水位
+  "d_hwm": 32,          // DataProc 任务栈高水位
+  "o_hwm": 120,         // OTA 任务栈高水位
+  "e_hwm": 80           // ESP32Comm 任务栈高水位
+}
+```
+
+### 数据链路
+
+```text
+STM32 vDataProcessTask → USART2 JSON → ESP32 uart_rx_task
+  → mqtt_publish_diagnostics() → MQTT topic: device/stm32_iot2/diagnostics
+  → Python diag_monitor.py 实时显示
+```
+
+### 诊断监控脚本
+
+```bash
+# TLS + 认证
+python tests/diag_monitor.py --broker 192.168.0.3 --tls-ca certs/ca.crt \
+    --mqtt-user iot2_sender --mqtt-pass sender_secure_2026
+
+# 明文（本地调试）
+python tests/diag_monitor.py --broker 127.0.0.1 --mqtt-port 1883
+```
+
+输出示例：
+
+```text
+IoT2 Diagnostics Monitor
+Connecting to 192.168.0.3:8883 ...
+============================================================
+[14:30:15] Connected to MQTT broker
+  Subscribed: device/stm32_iot2/diagnostics
+  Subscribed: device/stm32_iot2/sensor/data
+  Subscribed: device/stm32_iot2/sensor/alert
+  Subscribed: device/stm32_iot2/heartbeat
+  Subscribed: device/stm32_iot2/ota/status
+[14:30:25] HB    | status=alive uptime=120s wifi=true
+[14:30:30] SENSOR| temp=26C humi=55% avg_t=25 avg_h=54
+[14:30:45] DIAG  | uptime=00:02:00 heap=2048 tasks=5 ota=idle wdog=ON
+         HWM  | sensor=48 dataproc=32 ota=120 esp_comm=80
+```
+
+---
+
 ## 下一步（可选）
 
 - [x] Phase 7：安全加固（TLS + MQTT 认证 + HMAC-SHA256 + 防回滚）✅
-- [ ] Phase 8：IWDG 硬件看门狗联动（检测运行中崩溃，触发 boot_count 累加）
-- [ ] Phase 9：远程诊断（FreeRTOS 堆/任务状态定时上报 MQTT）
+- [x] Phase 8：IWDG 硬件看门狗联动（检测运行中崩溃，触发 boot_count 累加）✅
+- [x] Phase 9：远程诊断（MQTT 实时上报诊断数据 + Python 监控脚本）✅
 - [ ] Phase 10：多设备管理（MQTT 通配符订阅 + 设备 ID 路由）

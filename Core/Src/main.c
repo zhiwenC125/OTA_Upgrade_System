@@ -8,6 +8,7 @@
 #include "w25qxx.h"
 #include "dht11.h"
 #include "sensor_task.h"
+#include "iwdg.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "event_groups.h"
@@ -63,6 +64,9 @@ int main(void)
         while (1);
     }
 
+    /* 3. 启动 IWDG 硬件看门狗（~4s 超时，启动后无法停止） */
+    IWDG_Init();
+
     printf("[System] FreeRTOS Starting...\r\n");
 
 #ifdef ENABLE_COMM_TEST
@@ -94,4 +98,15 @@ int main(void)
         printf("[Error] RTOS Start Failed!\r\n");
         HAL_Delay(1000);
     }
+}
+
+/* ============================================================================
+ * FreeRTOS Idle Hook — IWDG 喂狗
+ *
+ * 只要调度器正常运行且无任务独占 CPU，idle task 就会执行 → 喂狗。
+ * 任何任务死循环/HardFault → idle 不运行 → 4s 超时 → IWDG 复位。
+ * ============================================================================ */
+void vApplicationIdleHook(void)
+{
+    IWDG_Feed();
 }

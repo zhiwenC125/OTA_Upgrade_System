@@ -2,6 +2,7 @@
 #include "ota_meta.h"
 #include "sha256.h"
 #include "usart1.h"
+#include "iwdg.h"
 #include "flash_if.h"
 #include "w25qxx.h"
 #include "task.h"
@@ -229,6 +230,7 @@ void ota_process_frame(const uint8_t *buf, uint16_t len,
         /* ---- 备份当前 App 到 W25Q32 Backup 区（供回滚用，约 2s） ---- */
         ota_printf("[OTA] Backing up current App (55KB) to W25Q32 Backup...\r\n");
         W25Qxx_EraseBlock64(W25QXX_OTA_BACKUP_ADDR);
+        IWDG_Feed();    /* 64KB 擦除约 1.5s，喂狗防超时 */
         {
             uint8_t  bak_buf[256];
             uint32_t bak_offset = 0U;
@@ -238,12 +240,14 @@ void ota_process_frame(const uint8_t *buf, uint16_t len,
                 Flash_If_Read(FLASH_APP_ADDR + bak_offset, bak_buf, chunk);
                 W25Qxx_Write(W25QXX_OTA_BACKUP_ADDR + bak_offset, bak_buf, chunk);
                 bak_offset += chunk;
+                IWDG_Feed();    /* 每 256B 写入后喂狗 */
             }
         }
         ota_printf("[OTA] Backup OK\r\n");
 
         /* ---- 擦除 W25Q32 Download 区（64KB block，约 1.5s） ---- */
         W25Qxx_EraseBlock64(W25QXX_OTA_DOWNLOAD_ADDR);
+        IWDG_Feed();    /* 擦除后喂狗 */
 
         /* 初始化上下文 */
         s_fw_total_size = fw_size;

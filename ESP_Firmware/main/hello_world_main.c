@@ -116,12 +116,14 @@ static void uart_rx_task(void *param)
                      (unsigned long)rx_count, len, (char *)rx_buf);
 
             /* 根据内容类型路由到不同 MQTT 主题：
-             * - JSON（以 '{' 开头）：传感器数据/告警/统计
+             * - JSON（以 '{' 开头）：传感器数据/告警/诊断
              * - 其他文本：OTA 响应（[OTA] ACK/NACK/...） */
             if (mqtt_is_connected()) {
                 if (len >= 2 && rx_buf[0] == '{') {
                     if (strstr((char *)rx_buf, "\"type\":\"alert\"")) {
                         mqtt_publish_alert((const char *)rx_buf, len);
+                    } else if (strstr((char *)rx_buf, "\"type\":\"diag\"")) {
+                        mqtt_publish_diagnostics((const char *)rx_buf, len);
                     } else {
                         mqtt_publish_sensor((const char *)rx_buf, len);
                     }

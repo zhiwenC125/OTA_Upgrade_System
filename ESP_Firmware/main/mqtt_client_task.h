@@ -60,4 +60,9 @@ esp_err_t mqtt_publish_sensor(const char *data, int len);
  */
 esp_err_t mqtt_publish_alert(const char *data, int len);
 
+/**
+ * @brief  发布诊断数据到 diagnostics 主题（QoS 0）
+ */
+esp_err_t mqtt_publish_diagnostics(const char *data, int len);
+
 #endif /* MQTT_CLIENT_TASK_H */

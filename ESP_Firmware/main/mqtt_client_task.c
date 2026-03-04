@@ -295,3 +295,11 @@ esp_err_t mqtt_publish_alert(const char *data, int len)
                                          data, len, 1, 0);
     return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
 }
+
+esp_err_t mqtt_publish_diagnostics(const char *data, int len)
+{
+    if (!s_mqtt_connected || s_mqtt_client == NULL) return ESP_FAIL;
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, MQTT_TOPIC_DIAGNOSTICS,
+                                         data, len, 0, 0);
+    return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+}

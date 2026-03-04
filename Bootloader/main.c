@@ -138,11 +138,17 @@ static HAL_StatusTypeDef Boot_EraseApp(void)
     FLASH_EraseInitTypeDef erase;
     uint32_t page_err = 0;
 
+    IWDG->KR = 0xAAAAU;  /* 喂狗：55KB 擦除耗时较长 */
+
     erase.TypeErase   = FLASH_TYPEERASE_PAGES;
     erase.PageAddress = FLASH_APP_ADDR;
     erase.NbPages     = FLASH_APP_PAGES;
 
-    return HAL_FLASHEx_Erase(&erase, &page_err);
+    HAL_StatusTypeDef st = HAL_FLASHEx_Erase(&erase, &page_err);
+
+    IWDG->KR = 0xAAAAU;  /* 擦除完成后再喂一次 */
+
+    return st;
 }
 
 static HAL_StatusTypeDef Boot_CopyW25QToAppFrom(uint32_t w25q_src_addr)
@@ -175,6 +181,8 @@ static HAL_StatusTypeDef Boot_CopyW25QToAppFrom(uint32_t w25q_src_addr)
 
         src_addr  += chunk;
         remaining -= chunk;
+
+        IWDG->KR = 0xAAAAU;  /* 每 256B 拷贝后喂狗 */
     }
 
     return HAL_OK;

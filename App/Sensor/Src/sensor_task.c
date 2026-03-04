@@ -144,24 +144,30 @@ void vDataProcessTask(void *pvParameters)
             }
         }
 
-        /* ---- 运行时统计（每 15 次有效读数 ≈ 30s） ---- */
+        /* ---- 远程诊断（每 15 次有效读数 ≈ 30s） ---- */
         stats_cnt++;
         if (stats_cnt >= 15 && !g_ota_session_active) {
             stats_cnt = 0;
 
-            char stats[128];
-            int sn = snprintf(stats, sizeof(stats),
-                "{\"type\":\"stats\",\"heap\":%u,"
+            uint32_t uptime_s = (uint32_t)(xTaskGetTickCount() / configTICK_RATE_HZ);
+
+            char diag[160];
+            int sn = snprintf(diag, sizeof(diag),
+                "{\"type\":\"diag\",\"up\":%lu,\"heap\":%u,"
+                "\"tasks\":%u,\"ota\":%u,\"wdog\":1,"
                 "\"s_hwm\":%u,\"d_hwm\":%u,"
                 "\"o_hwm\":%u,\"e_hwm\":%u}\r\n",
+                (unsigned long)uptime_s,
                 (unsigned)xPortGetFreeHeapSize(),
+                (unsigned)uxTaskGetNumberOfTasks(),
+                (unsigned)g_ota_session_active,
                 (unsigned)uxTaskGetStackHighWaterMark(xSensorTaskHandle),
                 (unsigned)uxTaskGetStackHighWaterMark(xDataProcessTaskHandle),
                 (unsigned)uxTaskGetStackHighWaterMark(xOtaTaskHandle),
                 (unsigned)uxTaskGetStackHighWaterMark(xEspCommTaskHandle));
 
             if (xSemaphoreTake(xUart2TxMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                HAL_UART_Transmit(&huart2, (uint8_t *)stats, (uint16_t)sn, 200);
+                HAL_UART_Transmit(&huart2, (uint8_t *)diag, (uint16_t)sn, 200);
                 xSemaphoreGive(xUart2TxMutex);
             }
         }
